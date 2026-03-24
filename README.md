@@ -1,4 +1,4 @@
-thsese days. This project is a **secondary development** based on Nanotron, aiming to equip it with **modern and advanced distributed training features**.
+**Nanotron** is an educational project inspired by Megatron-LM. However, official updates and support from the Hugging Face team have been limited these days. This project is a **secondary development** based on Nanotron, aiming to equip it with **modern and advanced distributed training features**.
 
 <h1 align="center">🚧 TODO</h1>
 
