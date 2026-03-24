@@ -1,6 +1,6 @@
+import logging
 import warnings
 from typing import Dict, List, Optional, Union
-
 import numpy as np
 
 try:
@@ -8,6 +8,7 @@ try:
         Dataset,
         DatasetDict,
         Features,
+        IterableDataset,
         Sequence,
         Value,
         concatenate_datasets,
@@ -15,6 +16,11 @@ try:
     )
 except ImportError:
     warnings.warn("Datasets not installed, you'll be unable to use these dataset processing functions.")
+
+try:
+    import pyarrow.dataset
+except ImportError:
+    pyarrow = None
 
 # Import SFT processing functions for backward compatibility
 
@@ -79,10 +85,75 @@ def clm_process(
     return train_dataset
 
 
+def clm_process_streaming(
+    raw_dataset: "IterableDataset",
+    tokenizer,
+    text_column_name: str,
+    sequence_length: int,
+):
+    """
+    Streaming version of clm_process for HuggingFace IterableDataset.
+    Tokenizes and groups texts into chunks of `sequence_length + 1` with 1-token overlap.
+    Processes in batches via IterableDataset.map() for efficiency.
+
+    Args:
+        raw_dataset: IterableDataset containing raw text
+        tokenizer: HuggingFace tokenizer
+        text_column_name: Name of the column containing text data
+        sequence_length: Maximum sequence length
+
+    Returns:
+        IterableDataset with tokenized sequences (input_ids column)
+    """
+
+    def _tokenize_and_group(examples) -> Dict:
+        # HuggingFace IterableDataset.map(batched=True) with input_columns
+        # passes a list of strings directly when input_columns specifies a single column,
+        # or a list of dicts when input_columns is not specified
+        if isinstance(examples, list) and len(examples) > 0 and isinstance(examples[0], str):
+            # Case 1: List of strings - use directly
+            texts = examples
+        elif isinstance(examples, list):
+            # Case 2: List of dicts - extract text column
+            texts = [ex[text_column_name] for ex in examples]
+        else:
+            # Case 3: Dict of lists (standard non-streaming format)
+            texts = examples[text_column_name]
+        tokenized = tokenizer(
+            texts,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        tokens_list = tokenized["input_ids"]
+
+        result_input_ids = []
+        for tokens in tokens_list:
+            # tokens may be a list or tensor; normalize to list
+            if hasattr(tokens, "tolist"):
+                buffer = tokens.tolist()
+            else:
+                buffer = list(tokens)
+
+            while len(buffer) >= sequence_length + 1:
+                result_input_ids.append(np.array(buffer[: sequence_length + 1], dtype=np.int64))
+                buffer = buffer[sequence_length:]
+
+        return {"input_ids": result_input_ids}
+
+    return raw_dataset.map(
+        _tokenize_and_group,
+        input_columns=text_column_name,
+        remove_columns=raw_dataset.column_names,
+        batched=True,
+        batch_size=1000,
+    )
+
+
 def get_datasets(
     hf_dataset_or_datasets: Union[dict, str],
     hf_dataset_config_name: str,
     splits: Optional[Union[List[str], str]] = ["train", "test"],
+    streaming: bool = False,
 ) -> "DatasetDict":
     """
     Function to load dataset directly from arguments.
@@ -94,6 +165,7 @@ def get_datasets(
         hf_dataset_config_name: Configuration name for the dataset
         splits: Section of the dataset to load, defaults to ["train", "test"]
             Can be a single string or a list of splits to load.
+        streaming: If True, use streaming mode to avoid downloading the full dataset.
 
     Returns:
         DatasetDict: DatasetDict object containing the loaded datasets
@@ -102,6 +174,11 @@ def get_datasets(
         splits = [splits]
 
     if isinstance(hf_dataset_or_datasets, dict):
+        if streaming:
+            raise ValueError(
+                "Dataset mixing via dict is not supported in streaming mode. "
+                "Please specify a single dataset path or disable streaming."
+            )
         # Structure of the config to read the datasets and their mix
         # datasets_mixer:
         #     - 'dataset1': 0.5
@@ -112,11 +189,23 @@ def get_datasets(
         # e.g. Dataset = "HuggingFaceH4/testing_alpaca_small"
         # Note this returns things other than just train/test, which may not be intended
         raw_datasets = DatasetDict()
+
+        fragment_scan_options = None
+        if streaming and pyarrow is not None:
+            fragment_scan_options = pyarrow.dataset.ParquetFragmentScanOptions(
+                cache_options=pyarrow.CacheOptions(
+                    prefetch_limit=5,
+                    range_size_limit=64 << 20,  # 64MiB
+                ),
+            )
+
         for split in splits:
             raw_datasets[split] = load_dataset(
                 hf_dataset_or_datasets,
                 hf_dataset_config_name,
                 split=split,
+                streaming=streaming,
+                fragment_scan_options=fragment_scan_options,
             )
     else:
         raise ValueError(f"hf_dataset_or_datasets must be a dict or string but is {type(hf_dataset_or_datasets)}")

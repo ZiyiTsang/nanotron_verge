@@ -21,7 +21,19 @@ class ParallelContext:
     ):
         """Initialize parallel context."""
         world_size = int(os.environ["WORLD_SIZE"])
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8")) if world_size > 8 else world_size
+        if "LOCAL_WORLD_SIZE" in os.environ:
+            local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        elif world_size > 8:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                local_world_size = len(visible.split(","))
+            else:
+                raise RuntimeError(
+                    "LOCAL_WORLD_SIZE is not set and cannot infer from CUDA_VISIBLE_DEVICES. "
+                    "Please set the LOCAL_WORLD_SIZE environment variable."
+                )
+        else:
+            local_world_size = world_size
 
         assert (
             tensor_parallel_size * pipeline_parallel_size * context_parallel_size * data_parallel_size

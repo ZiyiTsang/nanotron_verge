@@ -1,4 +1,38 @@
-<h1 align="center">⚡️ Nanotron</h1>
+<h1 align="center">⚡️ Nanotron_Verge</h1>
+
+> **Nanotron** is an educational project inspired by Megatron-LM. However, official updates and support from the Hugging Face team have been limited. This project is a **secondary development** based on Nanotron, aiming to equip it with **modern and advanced distributed training features**.
+
+<h1 align="center">🚧 TODO</h1>
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Scheduler** | Task scheduling and resource allocation | |
+| Ray | Distributed computing framework integration | ✅ |
+| SkyPilot | Multi-cluster workload orchestration | 🚧 |
+| **Data** | Data loading and processing | |
+| Streaming Dataset | Efficient streaming data loading | ✅ |
+| **Model** | Model architecture and format support | |
+| Any2Nanotron Support | Model format conversion support | 🚧 |
+| **Metric** |  | |
+| MFU  | Support efficient utilization metrics | 🚧 |
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h1 align="center">⚡️ Origin Doc</h1>
 
 <p align="center">
     <a href="https://github.com/huggingface/nanotron/releases">
@@ -152,6 +186,25 @@ You can find more examples in the [`/examples`](/examples) directory:
 | `examples/config_tiny_llama_with_s3_upload.yaml` | For automatically uploading checkpoints to S3 |
 
 We're working on adding more examples soon! Feel free to add a PR to add your own example. 🚀
+
+### Ray Scheduler & Streaming Dataset
+
+**Ray Scheduler** - Multi-node distributed training with Ray Train:
+```shell
+ray start --head
+python ray_launcher.py --config examples/config_tiny_llama.yaml --num-nodes 1 --gpus-per-node 2
+```
+
+**Streaming Dataset** - HuggingFace datasets streaming for large-scale data:
+```yaml
+# examples/config_qwen_streaming.yaml
+dataset:
+  hf_dataset_or_datasets: HuggingFaceFW/fineweb-edu
+  text_column_name: text
+  streaming: true
+  streaming_buffer_size: 1
+num_loading_workers: 64
+```
 
 ## Benchmarks
 

@@ -28,6 +28,7 @@ from nanotron.data.dataloader import (
 )
 from nanotron.data.processing import (
     clm_process,
+    clm_process_streaming,
     get_datasets,
 )
 from nanotron.data.sft_processing import prepare_sft_dataset
@@ -119,6 +120,7 @@ def get_dataloader_from_data_stage(
                 hf_dataset_or_datasets=data.dataset.hf_dataset_or_datasets,
                 hf_dataset_config_name=data.dataset.hf_dataset_config_name,
                 splits=data.dataset.hf_dataset_splits,
+                streaming=data.dataset.streaming,
             )["train"]
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -149,41 +151,72 @@ def get_dataloader_from_data_stage(
                     num_proc=data.dataset.dataset_processing_num_proc_per_process,
                 )
             else:
-                # For pretraining, use existing CLM processing
-                train_dataset = clm_process(
-                    raw_dataset=raw_dataset,
-                    tokenizer=tokenizer,
-                    text_column_name=data.dataset.text_column_name,
-                    dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
-                    dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
-                    sequence_length=trainer.sequence_length,
-                )
+                # For pretraining, use CLM processing
+                if data.dataset.streaming:
+                    # Streaming mode: use streaming-friendly processing
+                    train_dataset = clm_process_streaming(
+                        raw_dataset=raw_dataset,
+                        tokenizer=tokenizer,
+                        text_column_name=data.dataset.text_column_name,
+                        sequence_length=trainer.sequence_length,
+                    )
+                else:
+                    # Non-streaming mode: use batch processing with full dataset
+                    train_dataset = clm_process(
+                        raw_dataset=raw_dataset,
+                        tokenizer=tokenizer,
+                        text_column_name=data.dataset.text_column_name,
+                        dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
+                        dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
+                        sequence_length=trainer.sequence_length,
+                    )
 
             # We load the processed dataset on the ranks requiring it
-            dataloader = get_train_dataloader(
-                train_dataset=train_dataset,
-                sequence_length=trainer.sequence_length,
-                parallel_context=trainer.parallel_context,
-                input_pp_rank=input_pp_rank,
-                output_pp_rank=output_pp_rank,
-                micro_batch_size=trainer.micro_batch_size,
-                consumed_train_samples_stage=consumed_train_samples_stage,
-                dataloader_num_workers=data.num_loading_workers,
-                seed_worker=data.seed,
-                dataloader_drop_last=True,
-                use_position_ids=isinstance(trainer.model_config, Qwen2Config),
-                sequence_sep_tokens=sequence_sep_tokens,  # Used to generate position ids
-            )
+            if data.dataset.streaming:
+                # Streaming mode: use streaming dataloader (doesn't need consumed_train_samples)
+                from nanotron.data.dataloader import get_streaming_dataloader
 
-            # Check if we have enough samples for train_steps
-            total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
-            num_tokens_needed_for_training = (
-                num_remaining_train_steps * trainer.global_batch_size * trainer.sequence_length
-            )
-            assert num_tokens_needed_for_training <= total_tokens_dataset, (
-                f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
-                f"Try train_steps<={len(dataloader.dataset) // trainer.global_batch_size + trainer.iteration_step}"
-            )
+                dataloader = get_streaming_dataloader(
+                    train_dataset=train_dataset,
+                    sequence_length=trainer.sequence_length,
+                    parallel_context=trainer.parallel_context,
+                    input_pp_rank=input_pp_rank,
+                    output_pp_rank=output_pp_rank,
+                    micro_batch_size=trainer.micro_batch_size,
+                    dataloader_num_workers=data.num_loading_workers,
+                    seed_worker=data.seed,
+                    dataloader_drop_last=True,
+                    sequence_sep_tokens=sequence_sep_tokens,
+                    use_position_ids=isinstance(trainer.model_config, Qwen2Config),
+                    streaming_buffer_size=data.dataset.streaming_buffer_size,
+                )
+                # Streaming dataset doesn't support len(), so we skip the dataset size check
+            else:
+                # Non-streaming mode: use standard dataloader
+                dataloader = get_train_dataloader(
+                    train_dataset=train_dataset,
+                    sequence_length=trainer.sequence_length,
+                    parallel_context=trainer.parallel_context,
+                    input_pp_rank=input_pp_rank,
+                    output_pp_rank=output_pp_rank,
+                    micro_batch_size=trainer.micro_batch_size,
+                    consumed_train_samples=consumed_train_samples_stage,
+                    dataloader_num_workers=data.num_loading_workers,
+                    seed_worker=data.seed,
+                    dataloader_drop_last=True,
+                    use_position_ids=isinstance(trainer.model_config, Qwen2Config),
+                    sequence_sep_tokens=sequence_sep_tokens,  # Used to generate position ids
+                )
+
+                # Check if we have enough samples for train_steps
+                total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
+                num_tokens_needed_for_training = (
+                    num_remaining_train_steps * trainer.global_batch_size * trainer.sequence_length
+                )
+                assert num_tokens_needed_for_training <= total_tokens_dataset, (
+                    f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
+                    f"Try train_steps<={len(dataloader.dataset) // trainer.global_batch_size + trainer.iteration_step}"
+                )
 
     # Case 3: Nanosets
     elif isinstance(data.dataset, NanosetDatasetsArgs):

@@ -281,6 +281,8 @@ def get_train_dataloader(
     use_loop_to_round_batch_size: bool = False,
     sequence_sep_tokens: List[int] = None,
     use_position_ids: bool = True,
+    streaming: bool = False,
+    streaming_buffer_size: int = 1000,
 ) -> DataLoader:
     """
     Get a PyTorch DataLoader for training.
@@ -300,10 +302,29 @@ def get_train_dataloader(
         use_loop_to_round_batch_size: Whether to loop at the end of dataset to ensure batch size multiple
         sequence_sep_tokens: List of integers representing the sequence separator tokens, used to generate position ids e.g. [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
         use_position_ids: Whether to use position IDs in the collator
+        streaming: Whether the dataset is a streaming IterableDataset
+        streaming_buffer_size: Buffer size for streaming shuffle. Set to 1 to disable shuffling.
 
     Returns:
         PyTorch DataLoader for training
     """
+    if streaming:
+        return get_streaming_dataloader(
+            train_dataset=train_dataset,
+            sequence_length=sequence_length,
+            parallel_context=parallel_context,
+            input_pp_rank=input_pp_rank,
+            output_pp_rank=output_pp_rank,
+            micro_batch_size=micro_batch_size,
+            dataloader_num_workers=dataloader_num_workers,
+            seed_worker=seed_worker,
+            dataloader_drop_last=dataloader_drop_last,
+            dataloader_pin_memory=dataloader_pin_memory,
+            sequence_sep_tokens=sequence_sep_tokens,
+            use_position_ids=use_position_ids,
+            streaming_buffer_size=streaming_buffer_size,
+        )
+
     if not isinstance(train_dataset, datasets.Dataset):
         raise ValueError(f"training requires a datasets.Dataset, but got {type(train_dataset)}")
 
@@ -332,13 +353,11 @@ def get_train_dataloader(
         dataloader_num_workers = 0
 
     if use_position_ids:
-        # assert sequence_sep_tokens is not None, "sequence_sep_tokens must be provided if use_position_ids is True"
         data_collator = DataCollatorForCLMWithPositionIds(
             sequence_length=sequence_length,
             input_pp_rank=input_pp_rank,
             output_pp_rank=output_pp_rank,
             parallel_context=parallel_context,
-            sequence_sep_tokens=sequence_sep_tokens,
         )
     else:
         data_collator = DataCollatorForCLM(
@@ -367,6 +386,103 @@ def get_train_dataloader(
         train_dataset,
         batch_size=micro_batch_size,
         sampler=train_sampler,
+        collate_fn=data_collator,
+        drop_last=dataloader_drop_last,
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory,
+        worker_init_fn=get_dataloader_worker_init(dp_rank=dp_rank),
+        persistent_workers=True if dataloader_num_workers > 0 else False,
+    )
+
+
+def get_streaming_dataloader(
+    train_dataset: "datasets.IterableDataset",
+    sequence_length: int,
+    parallel_context: ParallelContext,
+    input_pp_rank: int,
+    output_pp_rank: int,
+    micro_batch_size: int,
+    dataloader_num_workers: int,
+    seed_worker: int,
+    dataloader_drop_last: bool = True,
+    dataloader_pin_memory: bool = True,
+    sequence_sep_tokens: List[int] = None,
+    use_position_ids: bool = True,
+    streaming_buffer_size: int = 1000,
+) -> DataLoader:
+    """
+    Get a PyTorch DataLoader for streaming IterableDataset training.
+
+    This function handles streaming datasets by:
+    1. Optional shuffling with a buffer
+    2. Sharding across DP workers
+    3. Converting to torch format
+    4. Using standard DataLoader with DataCollatorForCLM
+
+    Args:
+        train_dataset: IterableDataset to use for training
+        sequence_length: Maximum sequence length
+        parallel_context: Object containing process groups information
+        input_pp_rank: Rank responsible for input data
+        output_pp_rank: Rank responsible for output/label data
+        micro_batch_size: Size of each micro batch
+        dataloader_num_workers: Number of workers for the DataLoader
+        seed_worker: Random seed for shuffling (used when buffer_size > 1)
+        dataloader_drop_last: Whether to drop the last incomplete batch
+        dataloader_pin_memory: Whether to use pinned memory
+        sequence_sep_tokens: Sequence separator tokens for position ids
+        use_position_ids: Whether to use position IDs in the collator
+        streaming_buffer_size: Buffer size for shuffling. Set to 1 to disable shuffling.
+
+    Returns:
+        PyTorch DataLoader for streaming training
+    """
+    dp_ranks_size = parallel_context.dp_pg.size()
+    dp_rank = parallel_context.dp_pg.rank()
+    pp_rank = dist.get_rank(parallel_context.pp_pg)
+
+    # PP ranks that don't need data get an empty infinite dataset
+    if pp_rank not in [input_pp_rank, output_pp_rank]:
+        # Use a large sentinel value to simulate infinite data.
+        # DataLoader needs __len__ > 0 to iterate; EmptyInfiniteDataset(length=0)
+        # would cause the DataLoader to yield nothing, stalling the training loop.
+        train_dataset = EmptyInfiniteDataset(length=10**15)
+        dataloader_num_workers = 0
+
+    # PP ranks that need data: optionally shuffle, shard, and format
+    else:
+        # Shuffle with buffer if buffer_size > 1
+        if streaming_buffer_size > 1:
+            train_dataset = train_dataset.shuffle(buffer_size=streaming_buffer_size, seed=seed_worker)
+
+        # Shard: each DP worker gets its own shard
+        train_dataset = train_dataset.shard(num_shards=dp_ranks_size, index=dp_rank)
+
+        # Convert to torch format for DataLoader consumption
+        train_dataset = train_dataset.with_format(type="torch")
+
+    # Create appropriate data collator
+    if use_position_ids:
+        data_collator = DataCollatorForCLMWithPositionIds(
+            sequence_length=sequence_length,
+            input_pp_rank=input_pp_rank,
+            output_pp_rank=output_pp_rank,
+            parallel_context=parallel_context,
+        )
+    else:
+        data_collator = DataCollatorForCLM(
+            sequence_length=sequence_length,
+            input_pp_rank=input_pp_rank,
+            output_pp_rank=output_pp_rank,
+            parallel_context=parallel_context,
+        )
+
+
+    dist.barrier(parallel_context.tp_pg)
+
+    return DataLoader(
+        train_dataset,
+        batch_size=micro_batch_size,
         collate_fn=data_collator,
         drop_last=dataloader_drop_last,
         num_workers=dataloader_num_workers,

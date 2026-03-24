@@ -182,7 +182,7 @@ def parse_args():
         help="Directory to save generated Slurm scripts (set to None to disable)",
     )
     paths_group.add_argument(
-        "--save-interval", type=int, default=1000, help="Interval for saving checkpoints (in steps)"
+        "--checkpoint-interval", type=int, default=1000, help="Interval for saving checkpoints (in steps)"
     )
     paths_group.add_argument("--save-initial-state", action="store_true", help="Save initial state")
 
@@ -409,7 +409,7 @@ def create_nanotron_config(args) -> Config:
     os.makedirs(args.checkpoints_path, exist_ok=True)
     checkpoints = CheckpointsArgs(
         checkpoints_path=os.path.join(args.checkpoints_path, args.run),
-        checkpoint_interval=args.save_interval,
+        checkpoint_interval=args.checkpoint_interval,
         save_initial_state=args.save_initial_state,
     )
 

@@ -33,6 +33,49 @@ logger = get_logger(__name__)
 
 DEFAULT_SEED = 42
 
+# Peak FLOPS config - BF16 TFLOPs/s per GPU (dense compute)
+PEAK_FLOPS_BF16 = {
+    "H100": 989,
+    "H800": 989,
+    "A100": 312,
+    "A800": 312,
+    "V100": 125,
+    "RTX_4090": 98,
+}
+
+# Peak FLOPS config - FP16 TFLOPs/s per GPU (dense compute)
+PEAK_FLOPS_FP16 = {
+    "H100": 1979,  # H100 FP16 is 2x BF16
+    "H800": 1979,
+    "A100": 624,  # A100 FP16 is 2x BF16
+    "A800": 624,
+    "V100": 125,  # V100 FP16 equals BF16
+    "RTX_4090": 330,
+}
+
+
+def get_gpu_peak_flops(dtype: str = "bf16") -> float:
+    """Auto-detect GPU model and return peak FLOPS
+
+    Args:
+        dtype: Compute type, "bf16" or "fp16"
+
+    Returns:
+        Peak FLOPS in TFLOPs/s, returns 0 if no match found
+    """
+    config = PEAK_FLOPS_BF16 if dtype == "bf16" else PEAK_FLOPS_FP16
+
+    # Get GPU model name
+    gpu_type = torch.cuda.get_device_name(0)
+
+    # Match against config dictionary
+    for key, value in config.items():
+        if key.upper() in gpu_type.upper():
+            return value
+
+    # No match found, return 0
+    return 0
+
 
 @dataclass
 class BenchArgs:
@@ -102,6 +145,8 @@ class PretrainDatasetsArgs:
     dataset_processing_num_proc_per_process: Optional[int] = 1
     dataset_overwrite_cache: Optional[bool] = False
     text_column_name: Optional[str] = None
+    streaming: Optional[bool] = False
+    streaming_buffer_size: Optional[int] = 1000
 
     def __post_init__(self):
         if self.text_column_name is None:
@@ -120,6 +165,8 @@ class SFTDatasetsArgs:
     dataset_overwrite_cache: Optional[bool] = False
     sft_dataloader: Optional[bool] = True
     debug_max_samples: Optional[int] = None
+    streaming: Optional[bool] = False
+    streaming_buffer_size: Optional[int] = 1000
 
     def __post_init__(self):
         if self.hf_dataset_splits is None:

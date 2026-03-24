@@ -25,6 +25,7 @@ from nanotron.data.dataloader import (
 )
 from nanotron.data.processing import (
     clm_process,
+    clm_process_streaming,
     get_datasets,
 )
 from nanotron.helpers import (
@@ -104,7 +105,14 @@ def get_dataloader_from_data_stage(
 
     # Case 2: HuggingFace datasets
     elif isinstance(data.dataset, PretrainDatasetsArgs):
-        log_rank("Using `datasets` library", logger=logger, level=logging.INFO, rank=0)
+        streaming = getattr(data.dataset, "streaming", False)
+        streaming_buffer_size = getattr(data.dataset, "streaming_buffer_size", 1000)
+        log_rank(
+            f"Using `datasets` library (streaming={streaming})",
+            logger=logger,
+            level=logging.INFO,
+            rank=0,
+        )
         tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
         log_rank(
             f"Loading tokenizer from {tokenizer_path} and transformers/hf_hub versions {tf_version, hf_hub_version}",
@@ -120,6 +128,7 @@ def get_dataloader_from_data_stage(
                 hf_dataset_or_datasets=data.dataset.hf_dataset_or_datasets,
                 hf_dataset_config_name=data.dataset.hf_dataset_config_name,
                 splits=data.dataset.hf_dataset_splits,
+                streaming=streaming,
             )["train"]
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -127,14 +136,23 @@ def get_dataloader_from_data_stage(
             tokenizer.padding_side = "left"
 
             # We apply the Causal Language Modeling preprocessing
-            train_dataset = clm_process(
-                raw_dataset=raw_dataset,
-                tokenizer=tokenizer,
-                text_column_name=data.dataset.text_column_name,
-                dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
-                dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
-                sequence_length=trainer.sequence_length,
-            )
+            if streaming:
+                # Streaming mode: process in DataLoader workers with batched map
+                train_dataset = clm_process_streaming(
+                    raw_dataset=raw_dataset,
+                    tokenizer=tokenizer,
+                    text_column_name=data.dataset.text_column_name,
+                    sequence_length=trainer.sequence_length,
+                )
+            else:
+                train_dataset = clm_process(
+                    raw_dataset=raw_dataset,
+                    tokenizer=tokenizer,
+                    text_column_name=data.dataset.text_column_name,
+                    dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
+                    dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
+                    sequence_length=trainer.sequence_length,
+                )
 
             # We load the processed dataset on the ranks requiring it
             dataloader = get_train_dataloader(
@@ -148,17 +166,20 @@ def get_dataloader_from_data_stage(
                 dataloader_num_workers=data.num_loading_workers,
                 seed_worker=data.seed,
                 dataloader_drop_last=True,
+                streaming=streaming,
+                streaming_buffer_size=streaming_buffer_size,
             )
 
-            # Check if we have enough samples for train_steps
-            total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
-            num_tokens_needed_for_training = (
-                num_remaining_train_steps * trainer.global_batch_size * trainer.sequence_length
-            )
-            assert num_tokens_needed_for_training <= total_tokens_dataset, (
-                f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
-                f"Try train_steps<={len(dataloader.dataset) // trainer.global_batch_size + trainer.iteration_step}"
-            )
+            # Check if we have enough samples for train_steps (skip for streaming)
+            if not streaming:
+                total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
+                num_tokens_needed_for_training = (
+                    num_remaining_train_steps * trainer.global_batch_size * trainer.sequence_length
+                )
+                assert num_tokens_needed_for_training <= total_tokens_dataset, (
+                    f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
+                    f"Try train_steps<={len(dataloader.dataset) // trainer.global_batch_size + trainer.iteration_step}"
+                )
     else:
         raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}")
 

@@ -14,15 +14,20 @@ classifiers = [
     "Topic :: Software Development"
 ]
 dependencies = [
-    "torch>=1.13.1",
+    "torch==2.8",
     "pyyaml",
-    "numpy<2",
+    "numpy",
     "packaging",
     "safetensors",
     "dacite",
     "tqdm",
     "datasets",
-    "torchtyping"
+    "torchtyping",
+    "transformers>=5.3.0",
+    "psutil>=7.2.2",
+    "nv-grouped-gemm",
+    "flash-attn>=2.6.3",
+    "datatrove>=0.9.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -33,6 +38,10 @@ line-length = 119
 ignore = ["C901","E501"] # E501 ignores length violation handled by black
 select = ["C","E","F","I","W"]
 ignore-init-module-imports = true
+
+[tool.uv.sources]
+nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "main" }
+
 
 [project.optional-dependencies]
 dev = [

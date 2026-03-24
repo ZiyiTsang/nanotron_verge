@@ -259,6 +259,15 @@ class TensorParallelEmbedding(nn.Embedding):
         self.min_id = self.rank * block_size
         self.max_id = (self.rank + 1) * block_size
 
+        # Adjust padding_idx to be relative to this rank's local embedding block
+        if padding_idx is not None:
+            if padding_idx < self.min_id or padding_idx >= self.max_id:
+                # padding_idx is not in this rank's range, disable it for this rank
+                padding_idx = None
+            else:
+                # Convert global index to local index
+                padding_idx = padding_idx - self.min_id
+
         super().__init__(
             block_size,
             embedding_dim,

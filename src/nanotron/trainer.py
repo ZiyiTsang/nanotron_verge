@@ -20,13 +20,16 @@ from typing import (
     cast,
 )
 
+
 import psutil
 import torch
+from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from nanotron import distributed as dist
 from nanotron import logging
+import logging as std_logging
 from nanotron.config import (
     Config,
     DatasetStageArgs,
@@ -35,6 +38,7 @@ from nanotron.config import (
     RandomInit,
     SpectralMupInit,
     get_config_from_file,
+    get_gpu_peak_flops,
 )
 from nanotron.constants import MODEL_CONFIG_FILE_NAME
 from nanotron.data.dataloader import sanity_check_dataloader
@@ -103,6 +107,8 @@ from nanotron.serialize.metadata import DataStageMetadata, TrainingMetadata
 from nanotron.serialize.optimizer import load_optimizer, state_dict_to_device
 
 logger = logging.get_logger(__name__)
+std_logging.getLogger("requests").setLevel(std_logging.WARNING)
+std_logging.getLogger("urllib3").setLevel(std_logging.WARNING)
 
 # Reduce the logging noise from torch.distributed when creating new process groups
 dist_logger = logging.get_logger(dist.dist.__name__)
@@ -572,7 +578,7 @@ class DistributedTrainer:
 
                 # Training Logs
                 # Track consumed tokens for all dataset folders in current stage
-                if hasattr(self.current_base_dl, "dataset"):
+                if hasattr(self.current_base_dl, "dataset") and hasattr(self.current_base_dl.dataset, "get_consumption_stats"):
                     consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
                     current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
@@ -759,6 +765,14 @@ class DistributedTrainer:
             global_batch_size=self.global_batch_size,
         )
 
+        # Calculate MFU (Model FLOPS Utilization) percentage
+        # Auto-detect GPU model to get peak FLOPS, assuming BF16 training
+        peak_flops = get_gpu_peak_flops(dtype="bf16")
+        if peak_flops > 0:
+            mfu_percentage = (model_tflops / peak_flops) * 100
+        else:
+            mfu_percentage = 0  # Cannot calculate MFU
+
         # Get rank information (used by both console and wandb logging)
         tp_size = self.parallel_context.tp_pg.size()
         dp_cp_rank = dist.get_rank(self.parallel_context.dp_cp_pg)
@@ -782,6 +796,7 @@ class DistributedTrainer:
             LogItem("lr", lr, "human_format"),  # , ".3E"),
             LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
+            LogItem("mfu_percentage", mfu_percentage, "human_format"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
 
@@ -883,7 +898,7 @@ class DistributedTrainer:
             assert self.current_base_dl is not None, "current_base_dl should be defined"
 
             # Log consumption statistics
-            if hasattr(self.current_base_dl, "dataset"):
+            if hasattr(self.current_base_dl, "dataset") and hasattr(self.current_base_dl.dataset, "get_consumption_stats"):
                 for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
                     basic_log_entries.extend(
                         [
@@ -985,11 +1000,17 @@ class DistributedTrainer:
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
         """Initialize the model and load weights from checkpoint if needed."""
         # TODO: add max_position_embeddings
+        orig_vocab_size = self.model_config.vocab_size
         self.model_config.vocab_size = _vocab_size_with_padding(
             self.model_config.vocab_size,
             pg_size=self.parallel_context.tp_pg.size(),
             make_vocab_size_divisible_by=self.config.model.make_vocab_size_divisible_by,
         )
+        # If pad_token_id equals original vocab_size (meaning it's at the end of vocab),
+        # sync it to the new padded vocab_size (new end of vocab)
+        if self.model_config.pad_token_id is not None:
+            if self.model_config.pad_token_id == orig_vocab_size:
+                self.model_config.pad_token_id = self.model_config.vocab_size
 
         if (
             getattr(self.model_config, "max_position_embeddings", None) is not None
